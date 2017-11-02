@@ -104,3 +104,6 @@ print( "Accuracy:", clf.score(X_test, y_test))
 y_pred, y_true = evaluation(test_sentences)
 for l in classification_report(y_true, y_pred).split('\n'):
     print(l)
+
+t = "今天天气非常好。"
+print(list(pos_tag(t)))

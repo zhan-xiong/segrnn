@@ -1,15 +1,12 @@
 import argparse
 import numpy as np
 import random
+import time
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
-
-"""
-Pretrained word vectors: https://github.com/facebookresearch/fastText/blob/master/pretrained-vectors.md
-"""
 
 # Constants from C++ code
 EMBEDDING_DIM = 64
@@ -25,10 +22,10 @@ DURATION_DIM = 4
 # lstm builder: LAYERS, XCRIBE_DIM, SEG_DIM, m?
 # (layers, input_dim, hidden_dim, model)
 
-DATA_MAX_SEG_LEN = 15
+DATA_MAX_SEG_LEN = 10
 
-# not used
-MAX_SENTENCE_LEN = 200
+MAX_SENTENCE_LEN = 32
+MINIBATCH_SIZE = 1
 
 use_pretrained_embeding = False
 use_dropout = False
@@ -65,73 +62,80 @@ class SegRNN(nn.Module):
         self.W = nn.Linear(SEG_DIM, 1)
         self.Phi = nn.Tanh()
 
-    def calc_loss(self, data, label):
-        N, K = data.shape
+    def calc_loss(self, batch_data, batch_label):
+        N, B, K = batch_data.shape
+        print(B, len(batch_label))
+        forward_precalc, backward_precalc = self._precalc(batch_data)
 
-        forward_precalc = [[None for _ in range(N)] for _ in range(N)]
-        # forward_precalc[i, j, :] => [i, j]
-        for i in range(N):
-            hidden = self.forward_initial
-            for j in range(i, min(N, i + DATA_MAX_SEG_LEN)):
-                next_input = autograd.Variable(torch.from_numpy(data[j, :]).float())
-                out, hidden = self.forward_lstm(next_input.view(1, 1, K), hidden)
-                forward_precalc[i][j] = out
-
-        backward_precalc = [[None for _ in range(N)] for _ in range(N)]
-        # backward_precalc[i, j, :] => [i, j]
-        for i in range(N):
-            hidden = self.backward_initial
-            for j in range(i, max(-1, i - DATA_MAX_SEG_LEN), -1):
-                next_input = autograd.Variable(torch.from_numpy(data[j, :]).float())
-                out, hidden = self.backward_lstm(next_input.view(1, 1, K), hidden)
-                backward_precalc[j][i] = out
-
-        log_alphas = [autograd.Variable(torch.from_numpy(np.array([0.0])).float())]
+        log_alphas = [autograd.Variable(torch.zeros((1, B, 1)))]
         for i in range(1, N + 1):
             t_sum = []
             for j in range(max(0, i - DATA_MAX_SEG_LEN), i):
                 precalc_expand = torch.cat([forward_precalc[j][i - 1], backward_precalc[j][i - 1]], 2).repeat(len(LABELS), 1, 1)
-                y_encoding_expand = torch.cat([self.Y_encoding[y] for y in range(len(LABELS))], 0)
-                z_encoding_expand = torch.cat([self.Z_encoding[i - j - 1] for y in range(len(LABELS))])
+                y_encoding_expand = torch.cat([self.Y_encoding[y] for y in range(len(LABELS))], 0).repeat(1, B, 1)
+                z_encoding_expand = torch.cat([self.Z_encoding[i - j - 1] for y in range(len(LABELS))]).repeat(1, B, 1)
+                # LABELS, MINIBATCH, FEATURES
                 seg_encoding = torch.cat([precalc_expand, y_encoding_expand, z_encoding_expand], 2)
-                t = logsumexp(self.W(self.Phi(self.V(seg_encoding))))
-                t_sum.append(log_alphas[j] + t)
-            log_alphas.append(logsumexp(torch.cat(t_sum)))
+                # Linear thru features: LABELS, MINIBATCH, 1
+                t = self.W(self.Phi(self.V(seg_encoding)))
+                # summed across labels: 1, MINIBATCH, 1
+                summed_t = logsumexp(t, 0, True)
+                t_sum.append(log_alphas[j] + summed_t)
+            # cat across seglenths: SEG_LENGTH, MINIBATCH, 1
+            all_t_sums = torch.cat(t_sum, 0)
+            # sum across lengths: 1, MINIBATCH, 1
+            new_log_alpha = logsumexp(all_t_sums, 0, True)
+            log_alphas.append(new_log_alpha)
 
-        indiv = autograd.Variable(torch.zeros(1))
-        chars = 0
-        for tag, length in label:
-            if length >= DATA_MAX_SEG_LEN:
-                continue
-            seg_encoding = torch.cat([forward_precalc[chars][chars + length - 1], backward_precalc[chars][chars + length - 1], self.Y_encoding[LABELS.index(tag)], self.Z_encoding[length - 1]], 2)
-            indiv += self.W(self.Phi(self.V(seg_encoding)))
-        loss = log_alphas[N] - indiv
-        #print(log_alphas[N], indiv)
+        loss = torch.sum(log_alphas[N])
+
+        # TODO: test if alpha is actually sum over all tagged segment seqs
+        for batch_idx in range(B):
+            indiv = autograd.Variable(torch.zeros(1))
+            chars = 0
+            label = batch_label[batch_idx]
+            for tag, length in label:
+                if length >= DATA_MAX_SEG_LEN:
+                    continue
+                forward_val = forward_precalc[chars][chars + length - 1][:, batch_idx, np.newaxis, :]
+                backward_val = backward_precalc[chars][chars + length - 1][:, batch_idx, np.newaxis, :]
+                y_val = self.Y_encoding[LABELS.index(tag)]
+                z_val = self.Z_encoding[length - 1]
+                seg_encoding = torch.cat([forward_val, backward_val, y_val, z_val], 2)
+                indiv += self.W(self.Phi(self.V(seg_encoding)))
+                chars += length
+            loss -= indiv
         return loss
 
     def _precalc(self, data):
-        N, K = data.shape
+        N, B, K = data.shape
         forward_precalc = [[None for _ in range(N)] for _ in range(N)]
         # forward_precalc[i, j, :] => [i, j]
         for i in range(N):
-            hidden = self.forward_initial
+            hidden = (
+                torch.cat([self.forward_initial[0] for b in range(B)], 1),
+                torch.cat([self.forward_initial[1] for b in range(B)], 1)
+            )
             for j in range(i, min(N, i + DATA_MAX_SEG_LEN)):
                 next_input = autograd.Variable(torch.from_numpy(data[j, :]).float())
-                out, hidden = self.forward_lstm(next_input.view(1, 1, K), hidden)
+                out, hidden = self.forward_lstm(next_input.view(1, B, K), hidden)
                 forward_precalc[i][j] = out
 
         backward_precalc = [[None for _ in range(N)] for _ in range(N)]
         # backward_precalc[i, j, :] => [i, j]
         for i in range(N):
-            hidden = self.backward_initial
+            hidden = (
+                torch.cat([self.backward_initial[0] for b in range(B)], 1),
+                torch.cat([self.backward_initial[1] for b in range(B)], 1)
+            )
             for j in range(i, max(-1, i - DATA_MAX_SEG_LEN), -1):
                 next_input = autograd.Variable(torch.from_numpy(data[j, :]).float())
-                out, hidden = self.backward_lstm(next_input.view(1, 1, K), hidden)
+                out, hidden = self.backward_lstm(next_input.view(1, B, K), hidden)
                 backward_precalc[j][i] = out
         return forward_precalc, backward_precalc
 
     def infer(self, data):
-        N, K = data.shape
+        N, B, K = data.shape
         forward_precalc, backward_precalc = self._precalc(data)
         
         log_alphas = [(-1, -1, 0.0)]
@@ -145,14 +149,16 @@ class SegRNN(nn.Module):
                 y_encoding_expand = torch.cat([self.Y_encoding[y] for y in range(len(LABELS))], 0)
                 z_encoding_expand = torch.cat([self.Z_encoding[i - j - 1] for y in range(len(LABELS))])
                 seg_encoding = torch.cat([precalc_expand, y_encoding_expand, z_encoding_expand], 2)
-                t = self.W(self.Phi(self.V(seg_encoding))) + log_alphas[j][2]
+                t_val = self.W(self.Phi(self.V(seg_encoding)))
+                t = t_val + log_alphas[j][2]
+                # print("t_val: ", t_val)
                 for y in range(len(LABELS)):
                     if t.data[y, 0, 0] > max_t:
                         max_t = t.data[y, 0, 0]
                         max_label = y
                         max_len = i - j
             log_alphas.append((max_label, max_len, max_t))
-        
+
         cur_pos = N
         ret = []
         while cur_pos != 0:
@@ -174,12 +180,14 @@ def parse_file(train_filename, embedding):
     labels = []
     label = []
     POS_labels = set()
+    sentence = ""
+    label_sum = 0
     for line in train_file:
         if line.startswith("# text = "):
             sentence = line[9:].strip()
             N = len(sentence)
-            sentence_vec = np.zeros((N, EMBEDDING_DIM))
-            for i in range(N):
+            sentence_vec = np.zeros((MAX_SENTENCE_LEN, EMBEDDING_DIM))
+            for i in range(min(N, MAX_SENTENCE_LEN)):
                 c = sentence[i]
                 if c in embedding:
                     sentence_vec[i, :] = embedding[c]
@@ -191,10 +199,15 @@ def parse_file(train_filename, embedding):
         elif not line.startswith("#"):
             parts = line.split()
             if len(parts) < 4:
-                labels.append(label)
+                if len(sentence) != 0:
+                    labels.append((label, sentence))
                 label = []
+                label_sum = 0
+                sentence = ""
             else:
-                label.append((parts[3], len(parts[1])))
+                if (label_sum + len(parts[1])) <= MAX_SENTENCE_LEN:
+                    label_sum += len(parts[1])
+                    label.append((parts[3], len(parts[1])))
 
     return sentences, labels
 
@@ -218,20 +231,34 @@ if __name__ == "__main__":
     sum_loss = 0.0
     for batch_num in range(1000):
         random.shuffle(pairs)
-        for i in range(len(data)):
+        for i in range(0, len(pairs), MINIBATCH_SIZE):
+            start_time = time.time()
+
             optimizer.zero_grad()
 
-            datum, label = pairs[i]
-            loss = seg_rnn.calc_loss(datum, label)
+            batch_size = min(MINIBATCH_SIZE, len(pairs) - i)
+            batch_data = np.zeros((MAX_SENTENCE_LEN, batch_size, EMBEDDING_DIM))
+            batch_labels = []
+            for idx, (datum, (label, sentence)) in enumerate(pairs[i:i+batch_size]):
+                batch_data[:, idx, :] = datum
+                batch_labels.append(label)
+            loss = seg_rnn.calc_loss(batch_data, batch_labels)
             sum_loss += loss.data[0]
-            count += 1.0
+            count += 1.0 * batch_size
             loss.backward()
 
             optimizer.step()
-            if i % 10 == 0:
-                print("Batch ", batch_num, " datapoint ", i, " avg loss ", sum_loss / count)
-                print(seg_rnn.infer(datum))
-                print(label)
-                print(seg_rnn.Z_encoding[0])
-                #for param in seg_rnn.parameters():
-                #    print(param)
+
+            print("Batch ", batch_num, " datapoint ", i, " avg loss ", sum_loss / count)
+            sentence_len = len(pairs[i][1][1])
+            print(seg_rnn.infer(batch_data[0:sentence_len, 0, np.newaxis, :]))
+            print(pairs[i][1][0])
+            print(pairs[i][1][1])
+            # print(seg_rnn.Y_encoding[0], seg_rnn.Y_encoding[5])
+            # print(seg_rnn.Y_encoding[0].grad, seg_rnn.Y_encoding[5].grad)
+            #for param in seg_rnn.parameters():
+            #    print(param)
+
+            end_time = time.time()
+            print("Took ", end_time - start_time, " to run ", MINIBATCH_SIZE, " training sentences")
+        

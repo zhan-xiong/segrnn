@@ -12,7 +12,7 @@ import torch.nn.functional as F
 EMBEDDING_DIM = 64
 LAYERS = 1
 INPUT_DIM = 64
-XCRIBE_DIM = 32
+XCRIBE_DIM = 96
 SEG_DIM = 16
 H1DIM = 32
 H2DIM = 32
@@ -22,16 +22,13 @@ DURATION_DIM = 4
 # lstm builder: LAYERS, XCRIBE_DIM, SEG_DIM, m?
 # (layers, input_dim, hidden_dim, model)
 
-DATA_MAX_SEG_LEN = 10
+DATA_MAX_SEG_LEN = 15
 
 MAX_SENTENCE_LEN = 32
-MINIBATCH_SIZE = 1
-BATCH_SIZE = 100
+MINIBATCH_SIZE = 32
+BATCH_SIZE = 256
 
-use_dropout = False
-dropout_rate = 0.0
-ner_tagging = False
-use_max_sentence_len_training = False
+use_max_sentence_len_training = True
 
 LABELS = ['DET', 'AUX', 'ADJ', 'ADP', 'VERB', 'NOUN', 'SYM', 'PROPN', 'PART', 'X', 'CCONJ', 'PRON', 'ADV', 'PUNCT', 'NUM']
 
@@ -42,17 +39,17 @@ def logsumexp(inputs, dim=None, keepdim=False):
 class SegRNN(nn.Module):
     def __init__(self):
         super(SegRNN, self).__init__()
-        self.forward_context_initial = (nn.Parameter(torch.randn(1, 1, XCRIBE_DIM)), nn.Parameter(torch.randn(1, 1, XCRIBE_DIM)))
-        self.backward_context_initial = (nn.Parameter(torch.randn(1, 1, XCRIBE_DIM)), nn.Parameter(torch.randn(1, 1, XCRIBE_DIM)))
-        self.forward_context_lstm = nn.LSTM(INPUT_DIM, XCRIBE_DIM)
-        self.backward_context_lstm = nn.LSTM(INPUT_DIM, XCRIBE_DIM)
+        self.forward_context_initial = (nn.Parameter(torch.randn(2, 1, XCRIBE_DIM)), nn.Parameter(torch.randn(2, 1, XCRIBE_DIM)))
+        self.backward_context_initial = (nn.Parameter(torch.randn(2, 1, XCRIBE_DIM)), nn.Parameter(torch.randn(2, 1, XCRIBE_DIM)))
+        self.forward_context_lstm = nn.LSTM(INPUT_DIM, XCRIBE_DIM, 2, dropout=0.4)
+        self.backward_context_lstm = nn.LSTM(INPUT_DIM, XCRIBE_DIM, 2, dropout=0.4)
         self.register_parameter("forward_context_initial_0", self.forward_context_initial[0])
         self.register_parameter("forward_context_initial_1", self.forward_context_initial[1])
         self.register_parameter("backward_context_initial_0", self.backward_context_initial[0])
         self.register_parameter("backward_context_initial_1", self.backward_context_initial[1])
 
-        self.forward_initial = (nn.Parameter(torch.randn(1, 1, SEG_DIM)), nn.Parameter(torch.randn(1, 1, SEG_DIM)))
-        self.backward_initial = (nn.Parameter(torch.randn(1, 1, SEG_DIM)), nn.Parameter(torch.randn(1, 1, SEG_DIM)))
+        self.forward_initial = (nn.Parameter(torch.randn(2, 1, SEG_DIM)), nn.Parameter(torch.randn(2, 1, SEG_DIM)))
+        self.backward_initial = (nn.Parameter(torch.randn(2, 1, SEG_DIM)), nn.Parameter(torch.randn(2, 1, SEG_DIM)))
         self.Y_encoding = [nn.Parameter(torch.randn(1, 1, TAG_DIM)) for i in range(len(LABELS))]
         self.Z_encoding = [nn.Parameter(torch.randn(1, 1, DURATION_DIM)) for i in range(1, DATA_MAX_SEG_LEN + 1)]
 
@@ -65,8 +62,8 @@ class SegRNN(nn.Module):
         for idx, encoding in enumerate(self.Z_encoding):
             self.register_parameter("Z_encoding_" + str(idx), encoding)
 
-        self.forward_lstm = nn.LSTM(2 * XCRIBE_DIM, SEG_DIM)
-        self.backward_lstm = nn.LSTM(2 * XCRIBE_DIM, SEG_DIM)
+        self.forward_lstm = nn.LSTM(2 * XCRIBE_DIM, SEG_DIM, 2, dropout=0.4)
+        self.backward_lstm = nn.LSTM(2 * XCRIBE_DIM, SEG_DIM, 2, dropout=0.4)
         self.V = nn.Linear(SEG_DIM + SEG_DIM + TAG_DIM + DURATION_DIM, SEG_DIM)
         self.W = nn.Linear(SEG_DIM, 1)
         self.Phi = nn.Tanh()
@@ -216,7 +213,7 @@ def parse_file(train_filename, embedding, use_max_len=True):
     label_sum = 0
     for line in train_file:
         if line.startswith("# text = "):
-            sentence = line[9:].strip()
+            sentence = line[9:].strip().replace(" ", "")
             N = len(sentence)
             if use_max_len:
                 max_len = MAX_SENTENCE_LEN
@@ -274,9 +271,24 @@ def eval_f1(seg_rnn, pairs):
         predicted_segs += len(predicted_label)
         gold_segs += len(gold_label)
         correct_segs += count_correct_labels(predicted_label, gold_label)
-    print("Precision: ", correct_segs / predicted_segs)
-    print("Recall: ", correct_segs / gold_segs)
-
+    if predicted_segs > 0:
+        precision = correct_segs / predicted_segs
+    else:
+        precision = 0.0
+    print("Precision: ", precision)
+    if gold_segs > 0:
+        recall = correct_segs / gold_segs
+    else:
+        recall = 0.0
+    print("Recall: ", recall)
+    if precision > 0 and recall > 0:
+        f1 = 2.0 / (1.0 / precision + 1.0 / recall)
+    else:
+        f1 = 0.0
+    print("F1: " , f1)
+    f = open("eval_scores.txt", "a+")
+    f.write("%f %f %f\n" % (precision, recall, f1))
+    f.close()
 
 # Main function
 if __name__ == "__main__":
@@ -285,12 +297,15 @@ if __name__ == "__main__":
     parser.add_argument('--test', help='Test file')
     parser.add_argument('--embed', help='Character embedding file')
     parser.add_argument('--model', help='Saved model')
+    parser.add_argument('--lr', help='Learning rate (default=0.01)')
+    parser.add_argument('--evalOnly', help='Evaluate this model')
     args = parser.parse_args()
 
     embedding = parse_embedding(args.embed)
     print("Done parsing embedding")
     data, labels = parse_file(args.train, embedding, use_max_sentence_len_training)
     pairs = list(zip(data, labels))
+    # pairs = pairs[0:250]
     print("Done parsing training data")
 
     if args.test is not None:
@@ -302,8 +317,13 @@ if __name__ == "__main__":
         seg_rnn = torch.load(args.model)
     else:
         seg_rnn = SegRNN()
-    optimizer = torch.optim.Adam(seg_rnn.parameters(), lr=0.001)
-    random.seed(1338)
+
+    if args.lr is not None:
+        learning_rate = float(args.lr)
+    else:
+        learning_rate = 0.01
+
+    optimizer = torch.optim.Adam(seg_rnn.parameters(), lr=learning_rate)
     count = 0.0
     sum_loss = 0.0
     correct_count = 0.0
@@ -312,6 +332,7 @@ if __name__ == "__main__":
     for batch_num in range(1000):
         random.shuffle(pairs)
         for i in range(0, min(BATCH_SIZE, len(pairs)), MINIBATCH_SIZE):
+            seg_rnn.train()
             start_time = time.time()
 
             optimizer.zero_grad()
@@ -335,6 +356,7 @@ if __name__ == "__main__":
 
             optimizer.step()
 
+            seg_rnn.eval()
             print("Batch ", batch_num, " datapoint ", i, " avg loss ", sum_loss / count)
             sentence_len = len(pairs[i][1][1])
             pred = seg_rnn.infer(batch_data[0:sentence_len, 0, np.newaxis, :])
@@ -342,12 +364,17 @@ if __name__ == "__main__":
             print(pred)
             print(gold)
             print(pairs[i][1][1])
+            sentence_unk = ""
+            for c in pairs[i][1][1]:
+                sentence_unk += c if c in embedding or c in "0123456789" else "_"
+            print(sentence_unk)
             correct_count += count_correct_labels(pred, gold)
             sum_gold += len(gold)
             sum_pred += len(pred)
             cum_prec = correct_count / sum_pred
             cum_rec = correct_count / sum_gold
-            print("F1: ", 2.0 / (1.0 / cum_prec + 1.0 / cum_rec)," cum. precision: ", cum_prec, " cum. recall: ", cum_rec)
+            if cum_prec > 0 and cum_rec > 0:
+                print("F1: ", 2.0 / (1.0 / cum_prec + 1.0 / cum_rec)," cum. precision: ", cum_prec, " cum. recall: ", cum_rec)
             # print(seg_rnn.Y_encoding[0], seg_rnn.Y_encoding[5])
             # print(seg_rnn.Y_encoding[0].grad, seg_rnn.Y_encoding[5].grad)
             #for param in seg_rnn.parameters():
@@ -357,5 +384,6 @@ if __name__ == "__main__":
             print("Took ", end_time - start_time, " to run ", MINIBATCH_SIZE, " training sentences")
 
         if args.test is not None:
-            torch.save(seg_rnn, "seg_rnn.pt")
-            eval_f1(seg_rnn, test_pairs)
+            torch.save(seg_rnn, "seg_rnn_deep_" + str(batch_num) + ".pt")
+            if (batch_num + 1) % 30 == 0:
+                eval_f1(seg_rnn, test_pairs)

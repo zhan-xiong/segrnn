@@ -24,11 +24,12 @@ DURATION_DIM = 4
 
 DATA_MAX_SEG_LEN = 15
 
-MAX_SENTENCE_LEN = 32
-MINIBATCH_SIZE = 32
+MAX_SENTENCE_LEN = 48
+MINIBATCH_SIZE = 1
 BATCH_SIZE = 256
 
-use_max_sentence_len_training = True
+use_max_sentence_len_training = False
+use_bucket_training = False
 
 LABELS = ['DET', 'AUX', 'ADJ', 'ADP', 'VERB', 'NOUN', 'SYM', 'PROPN', 'PART', 'X', 'CCONJ', 'PRON', 'ADV', 'PUNCT', 'NUM']
 
@@ -101,7 +102,10 @@ class SegRNN(nn.Module):
             label = batch_label[batch_idx]
             for tag, length in label:
                 if length >= DATA_MAX_SEG_LEN:
+                    chars += length
                     continue
+                if chars + length > N:
+                    break
                 forward_val = forward_precalc[chars][chars + length - 1][:, batch_idx, np.newaxis, :]
                 backward_val = backward_precalc[chars][chars + length - 1][:, batch_idx, np.newaxis, :]
                 y_val = self.Y_encoding[LABELS.index(tag)]
@@ -133,6 +137,8 @@ class SegRNN(nn.Module):
             next_input = autograd.Variable(torch.from_numpy(data[i, :]).float())
             out, hidden = self.backward_context_lstm(next_input.view(1, B, K), hidden)
             backward_xcribe_data.append(out)
+
+        backward_xcribe_data.reverse()
 
         xcribe_data = []
         for i in range(N):
@@ -331,14 +337,23 @@ if __name__ == "__main__":
     sum_pred = 0.0
     for batch_num in range(1000):
         random.shuffle(pairs)
+        if use_bucket_training:
+            bucket_pairs = pairs[0:BATCH_SIZE]
+            bucket_pairs.sort(key=lambda x:x[0].shape[0])
+        else:
+            bucket_pairs = pairs
         for i in range(0, min(BATCH_SIZE, len(pairs)), MINIBATCH_SIZE):
             seg_rnn.train()
             start_time = time.time()
 
             optimizer.zero_grad()
-
             
-            if use_max_sentence_len_training:
+            if use_bucket_training:
+                batch_size = min(MINIBATCH_SIZE, len(pairs) - i)
+                max_len = bucket_pairs[i][0].shape[0]
+                print(bucket_pairs[i][0].shape[0])
+                print(bucket_pairs[i + batch_size - 1][0].shape[0])
+            elif use_max_sentence_len_training:
                 max_len = MAX_SENTENCE_LEN
                 batch_size = min(MINIBATCH_SIZE, len(pairs) - i)
             else:
@@ -346,8 +361,8 @@ if __name__ == "__main__":
                 batch_size = 1
             batch_data = np.zeros((max_len, batch_size, EMBEDDING_DIM))
             batch_labels = []
-            for idx, (datum, (label, sentence)) in enumerate(pairs[i:i+batch_size]):
-                batch_data[:, idx, :] = datum
+            for idx, (datum, (label, sentence)) in enumerate(bucket_pairs[i:i+batch_size]):
+                batch_data[:, idx, :] = datum[0:max_len, :]
                 batch_labels.append(label)
             loss = seg_rnn.calc_loss(batch_data, batch_labels)
             sum_loss += loss.data[0]
@@ -358,32 +373,33 @@ if __name__ == "__main__":
 
             seg_rnn.eval()
             print("Batch ", batch_num, " datapoint ", i, " avg loss ", sum_loss / count)
-            sentence_len = len(pairs[i][1][1])
-            pred = seg_rnn.infer(batch_data[0:sentence_len, 0, np.newaxis, :])
-            gold = pairs[i][1][0]
-            print(pred)
-            print(gold)
-            print(pairs[i][1][1])
-            sentence_unk = ""
-            for c in pairs[i][1][1]:
-                sentence_unk += c if c in embedding or c in "0123456789" else "_"
-            print(sentence_unk)
-            correct_count += count_correct_labels(pred, gold)
-            sum_gold += len(gold)
-            sum_pred += len(pred)
-            cum_prec = correct_count / sum_pred
-            cum_rec = correct_count / sum_gold
-            if cum_prec > 0 and cum_rec > 0:
-                print("F1: ", 2.0 / (1.0 / cum_prec + 1.0 / cum_rec)," cum. precision: ", cum_prec, " cum. recall: ", cum_rec)
-            # print(seg_rnn.Y_encoding[0], seg_rnn.Y_encoding[5])
-            # print(seg_rnn.Y_encoding[0].grad, seg_rnn.Y_encoding[5].grad)
-            #for param in seg_rnn.parameters():
-            #    print(param)
+            if i % 16 == 0:
+                sentence_len = len(bucket_pairs[i][1][1])
+                pred = seg_rnn.infer(batch_data[0:sentence_len, 0, np.newaxis, :])
+                gold = bucket_pairs[i][1][0]
+                print(pred)
+                print(gold)
+                print(bucket_pairs[i][1][1], sentence_len)
+                sentence_unk = ""
+                for c in bucket_pairs[i][1][1]:
+                    sentence_unk += c if c in embedding or c in "0123456789" else "_"
+                print(sentence_unk)
+                correct_count += count_correct_labels(pred, gold)
+                sum_gold += len(gold)
+                sum_pred += len(pred)
+                cum_prec = correct_count / sum_pred
+                cum_rec = correct_count / sum_gold
+                if cum_prec > 0 and cum_rec > 0:
+                    print("F1: ", 2.0 / (1.0 / cum_prec + 1.0 / cum_rec)," cum. precision: ", cum_prec, " cum. recall: ", cum_rec)
+                # print(seg_rnn.Y_encoding[0], seg_rnn.Y_encoding[5])
+                # print(seg_rnn.Y_encoding[0].grad, seg_rnn.Y_encoding[5].grad)
+                #for param in seg_rnn.parameters():
+                #    print(param)
 
             end_time = time.time()
             print("Took ", end_time - start_time, " to run ", MINIBATCH_SIZE, " training sentences")
 
         if args.test is not None:
-            torch.save(seg_rnn, "seg_rnn_deep_" + str(batch_num) + ".pt")
-            if (batch_num + 1) % 30 == 0:
-                eval_f1(seg_rnn, test_pairs)
+            torch.save(seg_rnn, "seg_rnn_correct_singlesentence_" + str(batch_num) + ".pt")
+            #if (batch_num + 1) % 10 == 0:
+            eval_f1(seg_rnn, test_pairs)
